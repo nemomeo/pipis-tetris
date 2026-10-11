@@ -47,7 +47,8 @@
       start: '开始游戏', paused: '已暂停', gameOver: '游戏结束',
       scoreLabel: '得分：', newRecord: '新纪录！',
       emptyHistory: '暂无记录，玩一局吧',
-      langBtn: 'EN', styleFmt: '风格：{n}'
+      langBtn: 'EN', styleFmt: '风格：{n}',
+      soundOn: '音效：开', soundOff: '音效：关'
     },
     en: {
       title: "Pipi's Tetris Game",
@@ -58,7 +59,8 @@
       start: 'Start Game', paused: 'Paused', gameOver: 'Game Over',
       scoreLabel: 'Score: ', newRecord: 'New Record!',
       emptyHistory: 'No records yet',
-      langBtn: '中文', styleFmt: 'Style: {n}'
+      langBtn: '中文', styleFmt: 'Style: {n}',
+      soundOn: 'Sound: On', soundOff: 'Sound: Off'
     }
   };
   let lang = localStorage.getItem('tetris_lang') === 'en' ? 'en' : 'zh';
@@ -112,7 +114,28 @@
 
   const PIECES = Object.keys(SHAPES);
 
-  // ---- 状态 ----
+  // 7-bag 随机：每袋包含全部 7 种方块各一个，打乱后依次取出
+  let bag = [];
+  function refillBag() {
+    bag = [...PIECES];
+    for (let i = bag.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [bag[i], bag[j]] = [bag[j], bag[i]];
+    }
+  }
+  function nextFromBag() {
+    if (bag.length === 0) refillBag();
+    return bag.pop();
+  }
+
+  function makePiece(type) {
+    return {
+      type,
+      rotation: 0,
+      x: Math.floor((COLS - SHAPES[type][0][0].length) / 2),
+      y: -1
+    };
+  }
   const board = createBoard();
   let current = null;
   let next = null;
@@ -130,6 +153,56 @@
   let bestAtStart = best; // 本局开始时的最高分，用于判断新纪录
   let history = [];
   try { history = JSON.parse(localStorage.getItem('tetris_history') || '[]'); } catch (e) { history = []; }
+
+  // ---- 音效（Web Audio API，无需外部文件） ----
+  let soundEnabled = localStorage.getItem('tetris_sound') !== '0';
+  let audioCtx = null;
+  function ensureAudio() {
+    if (!audioCtx) {
+      try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+      catch (e) { audioCtx = null; }
+    }
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    return audioCtx;
+  }
+  function beep(freq, dur, type = 'square', vol = 0.08) {
+    const ctx = ensureAudio();
+    if (!ctx || !soundEnabled) return;
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, ctx.currentTime);
+    gain.gain.setValueAtTime(vol, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + dur);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + dur);
+  }
+  function playSound(name) {
+    if (!soundEnabled) return;
+    switch (name) {
+      case 'move':    beep(220, 0.05, 'square', 0.05); break;
+      case 'rotate':  beep(440, 0.06, 'triangle', 0.06); break;
+      case 'drop':    beep(160, 0.08, 'sawtooth', 0.07); break;
+      case 'lock':    beep(120, 0.1, 'square', 0.06); break;
+      case 'clear':   // 单/双/三消
+        beep(523, 0.08, 'square', 0.07);
+        setTimeout(() => beep(659, 0.08, 'square', 0.07), 70);
+        setTimeout(() => beep(784, 0.1, 'square', 0.07), 140);
+        break;
+      case 'tetris':  // 四消
+        beep(523, 0.07, 'square', 0.08);
+        setTimeout(() => beep(659, 0.07, 'square', 0.08), 60);
+        setTimeout(() => beep(784, 0.07, 'square', 0.08), 120);
+        setTimeout(() => beep(1047, 0.16, 'square', 0.08), 180);
+        break;
+      case 'gameover':
+        beep(440, 0.15, 'sawtooth', 0.08);
+        setTimeout(() => beep(330, 0.15, 'sawtooth', 0.08), 130);
+        setTimeout(() => beep(220, 0.3, 'sawtooth', 0.08), 260);
+        break;
+    }
+  }
 
   // 消行动画状态
   const CLEAR_DURATION = 380; // 动画时长 ms
@@ -155,13 +228,7 @@
   }
 
   function randomPiece() {
-    const type = PIECES[Math.floor(Math.random() * PIECES.length)];
-    return {
-      type,
-      rotation: 0,
-      x: Math.floor((COLS - SHAPES[type][0][0].length) / 2),
-      y: -1
-    };
+    return makePiece(nextFromBag());
   }
 
   function getMatrix(piece) {
@@ -230,6 +297,7 @@
         localStorage.setItem('tetris_best', best);
       }
       updateStats();
+      playSound(cleared >= 4 ? 'tetris' : 'clear');
     }
     clearingRows = [];
     spawnNext();
@@ -253,22 +321,54 @@
     if (!canAct()) return;
     const oldRot = current.rotation;
     const newRot = (current.rotation + dir + 4) % 4;
-    current.rotation = newRot;
-    // 简单墙踢：尝试左右偏移
-    const kicks = [0, -1, 1, -2, 2];
-    for (const k of kicks) {
-      if (!collide(current, k, 0)) {
-        current.x += k;
+    // SRS 标准墙踢表（y 正向为上，游戏中 y 正向为下，应用时取反）
+    const kicks = getSRSKicks(current.type, oldRot, newRot);
+    for (const [dx, dy] of kicks) {
+      current.rotation = newRot;
+      if (!collide(current, dx, -dy)) {
+        current.x += dx;
+        current.y -= dy;
+        playSound('rotate');
         return;
       }
+      current.rotation = oldRot;
     }
-    current.rotation = oldRot;
+  }
+
+  // SRS 墙踢表：JLSTZ 与 I 各一套
+  const SRS_KICKS = {
+    JLSTZ: {
+      '0>1': [[0,0],[-1,0],[-1,1],[0,-2],[-1,-2]],
+      '1>0': [[0,0],[1,0],[1,-1],[0,2],[1,2]],
+      '1>2': [[0,0],[1,0],[1,-1],[0,2],[1,2]],
+      '2>1': [[0,0],[-1,0],[-1,1],[0,-2],[-1,-2]],
+      '2>3': [[0,0],[1,0],[1,1],[0,-2],[1,-2]],
+      '3>2': [[0,0],[-1,0],[-1,-1],[0,2],[-1,2]],
+      '3>0': [[0,0],[-1,0],[-1,-1],[0,2],[-1,2]],
+      '0>3': [[0,0],[1,0],[1,1],[0,-2],[1,-2]]
+    },
+    I: {
+      '0>1': [[0,0],[-2,0],[1,0],[-2,-1],[1,2]],
+      '1>0': [[0,0],[2,0],[-1,0],[2,1],[-1,-2]],
+      '1>2': [[0,0],[-1,0],[2,0],[-1,2],[2,-1]],
+      '2>1': [[0,0],[1,0],[-2,0],[1,-2],[-2,1]],
+      '2>3': [[0,0],[2,0],[-1,0],[2,1],[-1,-2]],
+      '3>2': [[0,0],[-2,0],[1,0],[-2,-1],[1,2]],
+      '3>0': [[0,0],[1,0],[-2,0],[1,-2],[-2,1]],
+      '0>3': [[0,0],[-1,0],[2,0],[-1,2],[2,-1]]
+    }
+  };
+  function getSRSKicks(type, from, to) {
+    const table = type === 'I' ? SRS_KICKS.I : (type === 'O' ? null : SRS_KICKS.JLSTZ);
+    if (!table) return [[0, 0]];
+    return table[`${from}>${to}`] || [[0, 0]];
   }
 
   function move(dir) {
     if (!canAct()) return;
     if (!collide(current, dir, 0)) {
       current.x += dir;
+      playSound('move');
     }
   }
 
@@ -278,6 +378,7 @@
       current.y++;
       score += 1;
       updateStats();
+      playSound('drop');
     } else {
       lockPiece();
     }
@@ -292,12 +393,14 @@
       dist++;
     }
     score += dist * 2;
+    playSound('drop');
     lockPiece();
     updateStats();
   }
 
   function lockPiece() {
     merge();
+    playSound('lock');
     const full = detectFullRows();
     if (full.length > 0) {
       // 进入消行动画：先闪光淡出，再塌陷计分
@@ -521,6 +624,7 @@
     for (let y = 0; y < ROWS; y++) {
       for (let x = 0; x < COLS; x++) board[y][x] = 0;
     }
+    bag = [];
     score = 0;
     lines = 0;
     level = 1;
@@ -531,6 +635,7 @@
     paused = false;
     running = true;
     bestAtStart = best;
+    ensureAudio();
     current = randomPiece();
     next = randomPiece();
     updateStats();
@@ -545,6 +650,7 @@
     gameOver = true;
     running = false;
     stopLoop();
+    playSound('gameover');
     saveHistory();
     const isNewRecord = score > bestAtStart && score > 0;
     showOverlay(T().gameOver, score, false, isNewRecord);
@@ -555,6 +661,7 @@
     paused = !paused;
     setPauseBtn();
     if (!paused) {
+      hideOverlay();
       startLoop();
     } else {
       stopLoop();
@@ -575,6 +682,7 @@
     });
     document.getElementById('btnLang').textContent = T().langBtn;
     applyThemeBtn();
+    applySoundBtn();
     setPauseBtn();
     renderHistory();
     // 弹窗若正在显示，同步其文案
@@ -737,6 +845,18 @@
     drawNext();
   });
 
+  // 音效开关
+  const btnSound = document.getElementById('btnSound');
+  function applySoundBtn() {
+    btnSound.textContent = soundEnabled ? T().soundOn : T().soundOff;
+  }
+  btnSound.addEventListener('click', () => {
+    soundEnabled = !soundEnabled;
+    localStorage.setItem('tetris_sound', soundEnabled ? '1' : '0');
+    applySoundBtn();
+    if (soundEnabled) { ensureAudio(); playSound('rotate'); }
+  });
+
   // 语言切换
   document.getElementById('btnLang').addEventListener('click', () => {
     lang = lang === 'zh' ? 'en' : 'zh';
@@ -750,6 +870,7 @@
   updateStats();
   renderHistory();
   applyThemeBtn();
+  applySoundBtn();
   drawNext();
   draw();
   showOverlay(T().title, null, false);

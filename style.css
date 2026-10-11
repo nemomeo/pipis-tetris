@@ -239,6 +239,7 @@ html, body {
 
 .footer {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   padding: 4px 4px 8px;
 }
